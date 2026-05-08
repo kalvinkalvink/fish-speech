@@ -1,0 +1,12 @@
+# Handle line endings automatically for text files
+* text=auto
+
+# Explicitly declare files that should always be LF (e.g., shell scripts)
+*.sh text eol=lf
+
+# Explicitly declare files that should always be CRLF
+*.bat text eol=crlf
+
+# Denote files that are binary and should not be touched
+*.png binary
+*.jpg binary
