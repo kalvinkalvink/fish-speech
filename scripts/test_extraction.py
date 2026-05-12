@@ -11,7 +11,7 @@ from urllib.parse import urlparse
 sys.path.insert(0, str(Path(__file__).parent.parent))
 
 DEFAULT_JSONL = Path(__file__).parent.parent / "wenetspeech_yue_meta.jsonl"
-COOKIES_DIR = Path(__file__).parent.parent / "cookies"
+COOKIES_DIR = Path(__file__).parent.parent / "scripts" / "cookies"
 OUTPUT_DIR = Path(__file__).parent.parent / "data"
 
 PLATFORM_CONFIG = {
@@ -22,7 +22,8 @@ PLATFORM_CONFIG = {
 }
 
 
-def detect_platform(url: str) -> str | None:
+def detect_platform(url: str) -> (str
+                                  | None):
     parsed = urlparse(url)
     domain = parsed.netloc.lower()
     for platform, config in PLATFORM_CONFIG.items():
