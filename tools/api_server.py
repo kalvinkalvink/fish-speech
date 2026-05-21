@@ -16,7 +16,7 @@ from kui.asgi import (
     OpenAPI,
     Routes,
 )
-from kui.cors import CORSConfig
+from kui.asgi import request
 from kui.openapi.specification import Info
 from kui.security import bearer_auth
 from loguru import logger
@@ -25,6 +25,7 @@ from typing_extensions import Annotated
 pyrootutils.setup_root(__file__, indicator=".project-root", pythonpath=True)
 
 from tools.server.api_utils import MsgPackRequest, parse_args
+from tools.server.cors_utils import browser_cors_middleware
 from tools.server.exception_handler import ExceptionHandler
 from tools.server.model_manager import ModelManager
 from tools.server.views import routes
@@ -37,7 +38,10 @@ class API(ExceptionHandler):
         self.args = args or parse_args()
 
         def api_auth(endpoint):
-            async def verify(token: Annotated[str, Depends(bearer_auth)]):
+            async def verify(token: Annotated[str | None, Depends(bearer_auth)] = None):
+                # CORS preflight must succeed without a bearer token.
+                if request.method == "OPTIONS":
+                    return await endpoint()
                 if token != self.args.api_key:
                     raise HTTPException(401, None, "Invalid token")
                 return await endpoint()
@@ -73,13 +77,16 @@ class API(ExceptionHandler):
                 Exception: self.other_exception_handler,
             },
             factory_class=FactoryClass(http=MsgPackRequest),
-            cors_config=CORSConfig(),
+            # browser_cors_middleware replaces default cors_config (Authorization +
+            # Access-Control-Allow-Private-Network for Chrome extensions → localhost).
+            http_middlewares=[browser_cors_middleware],
         )
 
         # Add the state variables
         self.app.state.lock = Lock()
         self.app.state.device = self.args.device
         self.app.state.max_text_length = self.args.max_text_length
+        self.app.state.llama_checkpoint_path = self.args.llama_checkpoint_path
 
         # Associate the app with the model manager
         self.app.on_startup(self.initialize_app)

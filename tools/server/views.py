@@ -36,6 +36,13 @@ from fish_speech.utils.schema import (
     ServeVQGANEncodeResponse,
     UpdateReferenceResponse,
 )
+from tools.server.openai_compat import (
+    OpenAISpeechRequest,
+    build_model_list,
+    build_voice_list,
+    log_openai_speech_error,
+    log_openai_speech_request,
+)
 from tools.server.api_utils import (
     buffer_to_async_generator,
     format_response,
@@ -143,66 +150,138 @@ async def vqgan_decode(req: Annotated[ServeVQGANDecodeRequest, Body(exclusive=Tr
         )
 
 
+async def _generate_tts(req: ServeTTSRequest) -> StreamResponse:
+    """Shared TTS generation for native and OpenAI-compatible endpoints."""
+    app_state = request.app.state
+    model_manager: ModelManager = app_state.model_manager
+    engine = model_manager.tts_inference_engine
+    sample_rate = engine.decoder_model.sample_rate
+
+    if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            content=f"Text is too long, max length is {app_state.max_text_length}",
+        )
+
+    if req.streaming and req.format != "wav":
+        raise HTTPException(
+            HTTPStatus.BAD_REQUEST,
+            content="Streaming only supports WAV format",
+        )
+
+    if req.streaming:
+        return StreamResponse(
+            iterable=inference_async(req, engine),
+            headers={
+                "Content-Disposition": f"attachment; filename=audio.{req.format}",
+            },
+            content_type=get_content_type(req.format),
+        )
+
+    fake_audios = next(inference(req, engine))
+    buffer = io.BytesIO()
+    sf.write(
+        buffer,
+        fake_audios,
+        sample_rate,
+        format=req.format,
+    )
+
+    return StreamResponse(
+        iterable=buffer_to_async_generator(buffer.getvalue()),
+        headers={
+            "Content-Disposition": f"attachment; filename=audio.{req.format}",
+        },
+        content_type=get_content_type(req.format),
+    )
+
+
 @routes.http.post("/v1/tts")
 async def tts(req: Annotated[ServeTTSRequest, Body(exclusive=True)]):
     """
     Generate speech from text using TTS model.
     """
     try:
-        # Get the model from the app
-        app_state = request.app.state
-        model_manager: ModelManager = app_state.model_manager
-        engine = model_manager.tts_inference_engine
-        sample_rate = engine.decoder_model.sample_rate
-
-        # Check if the text is too long
-        if app_state.max_text_length > 0 and len(req.text) > app_state.max_text_length:
-            raise HTTPException(
-                HTTPStatus.BAD_REQUEST,
-                content=f"Text is too long, max length is {app_state.max_text_length}",
-            )
-
-        # Check if streaming is enabled
-        if req.streaming and req.format != "wav":
-            raise HTTPException(
-                HTTPStatus.BAD_REQUEST,
-                content="Streaming only supports WAV format",
-            )
-
-        # Perform TTS
-        if req.streaming:
-            return StreamResponse(
-                iterable=inference_async(req, engine),
-                headers={
-                    "Content-Disposition": f"attachment; filename=audio.{req.format}",
-                },
-                content_type=get_content_type(req.format),
-            )
-        else:
-            fake_audios = next(inference(req, engine))
-            buffer = io.BytesIO()
-            sf.write(
-                buffer,
-                fake_audios,
-                sample_rate,
-                format=req.format,
-            )
-
-            return StreamResponse(
-                iterable=buffer_to_async_generator(buffer.getvalue()),
-                headers={
-                    "Content-Disposition": f"attachment; filename=audio.{req.format}",
-                },
-                content_type=get_content_type(req.format),
-            )
+        return await _generate_tts(req)
     except HTTPException:
-        # Re-raise HTTP exceptions as they are already properly formatted
         raise
     except Exception as e:
         logger.error(f"Error in TTS generation: {e}", exc_info=True)
         raise HTTPException(
             HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to generate speech"
         )
+
+
+@routes.http.post("/v1/audio/speech")
+async def openai_audio_speech(
+    req: Annotated[OpenAISpeechRequest, Body(exclusive=True)],
+):
+    """
+    OpenAI-compatible text-to-speech endpoint (POST /v1/audio/speech).
+    """
+    serve_req = None
+    try:
+        serve_req = req.to_serve_tts_request()
+        app_state = request.app.state
+        engine = app_state.model_manager.tts_inference_engine
+        log_openai_speech_request(
+            req,
+            serve_req,
+            available_reference_ids=engine.list_reference_ids(),
+        )
+        return await _generate_tts(serve_req)
+    except HTTPException as e:
+        log_openai_speech_error(e, req)
+        logger.warning(
+            "[OpenAI /v1/audio/speech] HTTP {}: {}",
+            e.status_code,
+            e.content,
+        )
+        raise
+    except Exception as e:
+        log_openai_speech_error(e, req)
+        logger.error(f"Error in OpenAI speech generation: {e}", exc_info=True)
+        raise HTTPException(
+            HTTPStatus.INTERNAL_SERVER_ERROR, content="Failed to generate speech"
+        )
+
+
+@routes.http.get("/v1/models")
+async def openai_list_models():
+    """
+    OpenAI-compatible models list (GET /v1/models).
+    """
+    app_state = request.app.state
+    checkpoint_path = getattr(app_state, "llama_checkpoint_path", "fish-speech")
+    return JSONResponse(build_model_list(checkpoint_path).model_dump())
+
+
+@routes.http.get("/v1/audio/voices")
+async def openai_list_voices():
+    """
+    List TTS voices for OpenAI-compatible clients (GET /v1/audio/voices).
+
+    Each entry includes id and name (some browser extensions require name).
+    """
+    app_state = request.app.state
+    model_manager: ModelManager = app_state.model_manager
+    engine = model_manager.tts_inference_engine
+    reference_ids = engine.list_reference_ids()
+    return JSONResponse(build_voice_list(reference_ids).model_dump())
+
+
+@routes.http.get("/v1/models/{model_id}")
+async def openai_get_model(model_id: str):
+    """
+    OpenAI-compatible single model lookup (GET /v1/models/{model_id}).
+    """
+    app_state = request.app.state
+    checkpoint_path = getattr(app_state, "llama_checkpoint_path", "fish-speech")
+    models = build_model_list(checkpoint_path).data
+    for model in models:
+        if model.id == model_id:
+            return JSONResponse(model.model_dump())
+    raise HTTPException(HTTPStatus.NOT_FOUND, content=f"Model '{model_id}' not found")
 
 
 @routes.http.post("/v1/references/add")
