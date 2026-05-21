@@ -36,6 +36,13 @@ def parse_args():
     parser.add_argument("--half", action="store_true")
     parser.add_argument("--compile", action="store_true")
     parser.add_argument("--max-gradio-length", type=int, default=0)
+    parser.add_argument(
+        "--max-seq-len",
+        type=int,
+        default=8192,
+        help="Max KV-cache sequence length at startup (lower=faster boot, less RAM/VRAM). "
+        "s2-pro config allows 32768 but that reserves ~4.5GB GPU cache alone.",
+    )
     parser.add_argument("--theme", type=str, default="light")
 
     return parser.parse_args()
@@ -62,6 +69,7 @@ if __name__ == "__main__":
         device=args.device,
         precision=args.precision,
         compile=args.compile,
+        max_seq_len=args.max_seq_len,
     )
 
     logger.info("Loading VQ-GAN model...")

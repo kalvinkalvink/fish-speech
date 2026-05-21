@@ -246,6 +246,50 @@ def _remap_fish_qwen3_omni_keys(weights: OrderedDict) -> OrderedDict:
     return new_weights
 
 
+def _parse_groupsize_from_path(path: Path, default: int = 128) -> int:
+    for part in path.name.split("-"):
+        if len(part) > 1 and part.startswith("g") and part[1:].isdigit():
+            return int(part[1:])
+    return default
+
+
+def _safetensors_has_bnb_weights(safetensors_path: Path) -> bool:
+    from safetensors import safe_open
+
+    with safe_open(str(safetensors_path), framework="pt") as f:
+        for key in f.keys():
+            if "quant_state.bitsandbytes" in key or key.endswith(".absmax"):
+                return True
+    return False
+
+
+def _detect_checkpoint_quantization(path: Path) -> tuple[str | None, int]:
+    """Detect quantization format. Returns (kind, groupsize).
+
+    kind is one of: None, "native_int4", "native_int8", "bnb_int4".
+    """
+    report_path = path / "quantize_report.json"
+    if report_path.exists():
+        with open(report_path) as f:
+            report = json.load(f)
+        if report.get("quantized_layers", 0) > 0 and report.get("mode") == "int4":
+            return "bnb_int4", int(report.get("groupsize", 128))
+
+    pth_file = path / "model.pth"
+    path_lower = path.as_posix().lower()
+
+    if pth_file.exists() and "int8" in path_lower:
+        return "native_int8", 128
+    if pth_file.exists() and "int4" in path_lower:
+        return "native_int4", _parse_groupsize_from_path(path)
+
+    single_st = path / "model.safetensors"
+    if single_st.exists() and _safetensors_has_bnb_weights(single_st):
+        return "bnb_int4", _parse_groupsize_from_path(path)
+
+    return None, 128
+
+
 class BaseTransformer(nn.Module):
     def __init__(
         self,
@@ -512,7 +556,7 @@ class BaseTransformer(nn.Module):
         match config.model_type:
             case "naive":
                 model_cls = NaiveTransformer
-            case "dual_ar":
+            case "dual_ar" | "fish_qwen3_omni":
                 model_cls = DualARTransformer
             case _:
                 raise ValueError(f"Unknown model type: {config.model_type}")
@@ -526,35 +570,66 @@ class BaseTransformer(nn.Module):
         if load_weights is False:
             logger.info("Randomly initialized model")
         else:
-            if "int8" in str(Path(path)):
+            path_obj = Path(path)
+            quant_kind, groupsize = _detect_checkpoint_quantization(path_obj)
+
+            if quant_kind == "native_int8":
                 logger.info("Using int8 weight-only quantization!")
                 from tools.llama.quantize import WeightOnlyInt8QuantHandler
 
                 simple_quantizer = WeightOnlyInt8QuantHandler(model)
                 model = simple_quantizer.convert_for_runtime()
-
-            if "int4" in str(Path(path)):
-                logger.info("Using int4 quantization!")
-                path_comps = path.name.split("-")
-                assert path_comps[-2].startswith("g")
-                groupsize = int(path_comps[-2][1:])
+            elif quant_kind == "native_int4":
+                logger.info(f"Using int4 weight-only quantization (groupsize={groupsize})!")
                 from tools.llama.quantize import WeightOnlyInt4QuantHandler
 
                 simple_quantizer = WeightOnlyInt4QuantHandler(model, groupsize)
                 model = simple_quantizer.convert_for_runtime()
+            elif quant_kind == "bnb_int4":
+                logger.info(
+                    f"Using bitsandbytes int4 quantization (groupsize={groupsize})!"
+                )
+                from tools.llama.quantize_s2 import replace_linear_with_bitsandbytes
 
-            path_obj = Path(path)
+                if not torch.cuda.is_available():
+                    raise RuntimeError(
+                        "bitsandbytes int4 checkpoints require CUDA to load weights."
+                    )
+                # Build Linear4bit on GPU and load packed weights directly (skip
+                # quantizing random CPU weights via model.to(cuda)).
+                model = replace_linear_with_bitsandbytes(
+                    model,
+                    "int4",
+                    groupsize,
+                    device="cuda",
+                    copy_fp_weights=False,
+                )
+                bnb_layers = sum(
+                    1
+                    for m in model.modules()
+                    if type(m).__name__ in ("Linear4bit", "Linear8bitLt")
+                )
+                logger.info(f"Prepared {bnb_layers} bitsandbytes linear layers for load")
+            elif "int4" in path_obj.name.lower() or "int8" in path_obj.name.lower():
+                logger.warning(
+                    f"Checkpoint path suggests quantization but weights look like "
+                    f"full precision; loading {path_obj.name} without quant runtime."
+                )
+
             index_json = path_obj / "model.safetensors.index.json"
             single_st = path_obj / "model.safetensors"
             pth_file = path_obj / "model.pth"
 
+            shard_weight_map = {}
             if index_json.exists():
+                with open(index_json) as f:
+                    shard_weight_map = json.load(f).get("weight_map", {})
+
+            if shard_weight_map:
                 logger.info("Loading sharded safetensors weights")
                 from safetensors.torch import load_file as st_load_file
 
-                with open(index_json) as f:
-                    st_index = json.load(f)
-                shard_files = sorted(set(st_index["weight_map"].values()))
+                shard_files = sorted(set(shard_weight_map.values()))
                 weights = OrderedDict()
                 for shard in shard_files:
                     weights.update(st_load_file(str(path_obj / shard), device="cpu"))
@@ -563,7 +638,10 @@ class BaseTransformer(nn.Module):
                 logger.info("Loading single safetensors weights")
                 from safetensors.torch import load_file as st_load_file
 
-                weights = OrderedDict(st_load_file(str(single_st), device="cpu"))
+                st_device = "cuda" if quant_kind == "bnb_int4" else "cpu"
+                weights = OrderedDict(
+                    st_load_file(str(single_st), device=st_device)
+                )
                 weights = _remap_fish_qwen3_omni_keys(weights)
             elif pth_file.exists():
                 weights = torch.load(
@@ -584,8 +662,17 @@ class BaseTransformer(nn.Module):
             else:
                 raise FileNotFoundError(f"No model weights found in {path_obj}")
 
-            err = model.load_state_dict(weights, strict=False, assign=True)
+            if quant_kind == "bnb_int4":
+                from tools.llama.quantize_s2 import load_bnb_quantized_state_dict
+
+                err = load_bnb_quantized_state_dict(model, weights, device="cuda")
+            else:
+                err = model.load_state_dict(weights, strict=False, assign=True)
+
             logger.info(f"Model weights loaded - Status: {err}")
+            if quant_kind == "bnb_int4":
+                del weights
+                torch.cuda.empty_cache()
 
         if lora_config is not None:
             setup_lora(model, lora_config)

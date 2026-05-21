@@ -359,10 +359,42 @@ def generate(
     return seq
 
 
-def init_model(checkpoint_path, device, precision, compile=False):
-    model = DualARTransformer.from_pretrained(checkpoint_path, load_weights=True)
+def _model_has_bnb_linear(model) -> bool:
+    try:
+        from bitsandbytes.nn import Linear4bit, Linear8bitLt
+    except ImportError:
+        return False
+    return any(
+        isinstance(m, (Linear4bit, Linear8bitLt)) for m in model.modules()
+    )
 
-    model = model.to(device=device, dtype=precision)
+
+def _move_model_to_device(model, device, precision):
+    """Move model to device without breaking bitsandbytes packed weights."""
+    if _model_has_bnb_linear(model):
+        model.to(device)
+        for param in model.parameters():
+            if param.is_floating_point():
+                param.data = param.data.to(device=device, dtype=precision)
+        for buffer in model.buffers():
+            if buffer.is_floating_point():
+                buffer.data = buffer.data.to(device=device, dtype=precision)
+    else:
+        model.to(device=device, dtype=precision)
+
+
+def init_model(
+    checkpoint_path,
+    device,
+    precision,
+    compile=False,
+    max_seq_len: int | None = None,
+):
+    model = DualARTransformer.from_pretrained(
+        checkpoint_path, load_weights=True, max_length=max_seq_len
+    )
+
+    _move_model_to_device(model, device, precision)
     logger.info(f"Restored model from checkpoint")
 
     if isinstance(model, DualARTransformer):
@@ -750,20 +782,29 @@ def launch_thread_safe_queue(
     device,
     precision,
     compile: bool = False,
+    max_seq_len: int | None = None,
 ):
     input_queue = queue.Queue()
     init_event = threading.Event()
 
     def worker():
         model, decode_one_token = init_model(
-            checkpoint_path, device, precision, compile=compile
+            checkpoint_path,
+            device,
+            precision,
+            compile=compile,
+            max_seq_len=max_seq_len,
         )
+        cache_seq_len = model.config.max_seq_len
+        if max_seq_len is not None:
+            cache_seq_len = min(cache_seq_len, max_seq_len)
         with torch.device(device):
             model.setup_caches(
                 max_batch_size=1,
-                max_seq_len=model.config.max_seq_len,
+                max_seq_len=cache_seq_len,
                 dtype=next(model.parameters()).dtype,
             )
+        logger.info(f"KV cache allocated for max_seq_len={cache_seq_len}")
         init_event.set()
 
         while True:
