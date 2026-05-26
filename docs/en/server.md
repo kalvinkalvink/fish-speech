@@ -70,6 +70,8 @@ Field mapping:
 
 `speed` is accepted for compatibility but not applied. `aac` is not supported.
 
+**Streaming (default):** `POST /v1/audio/speech` streams audio in **HTTP chunks** as synthesis progresses (WAV header first, then PCM segment bytes). This is enabled by default (`"stream": true`). Chunked streaming only supports `wav` — if you request `mp3` with `stream: true`, the server uses `wav` instead. For a single complete file (e.g. mp3), set `"stream": false`.
+
 **Extension voice list textbox:** enter plain voice names, one per line (not JSON). Example:
 
 ```

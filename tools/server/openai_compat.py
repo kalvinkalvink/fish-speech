@@ -49,6 +49,8 @@ class OpenAISpeechRequest(BaseModel):
     voice: str = "default"
     response_format: Literal["mp3", "opus", "aac", "flac", "wav", "pcm"] = "mp3"
     speed: float = Field(default=1.0, ge=0.25, le=4.0)
+    # Stream WAV chunks as they are synthesized (HTTP chunked). Set false for one-shot file.
+    stream: bool = True
 
     @model_validator(mode="before")
     @classmethod
@@ -81,6 +83,15 @@ class OpenAISpeechRequest(BaseModel):
             )
 
         fish_format = OPENAI_FORMAT_TO_FISH[self.response_format]
+        streaming = self.stream
+        if streaming and fish_format != "wav":
+            logger.warning(
+                "[OpenAI /v1/audio/speech] stream=true requires wav chunks; "
+                "overriding response_format from {!r} to 'wav'",
+                self.response_format,
+            )
+            fish_format = "wav"
+
         reference_id = None
         if self.voice not in OPENAI_BUILTIN_VOICES:
             reference_id = self.voice
@@ -94,6 +105,7 @@ class OpenAISpeechRequest(BaseModel):
             text=self.input,
             format=fish_format,
             reference_id=reference_id,
+            streaming=streaming,
         )
 
 
@@ -119,19 +131,21 @@ def log_openai_speech_request(
     )
     logger.info(
         "[OpenAI /v1/audio/speech] body: model={!r} voice={!r} response_format={!r} "
-        "speed={} input_len={} input_preview={!r}",
+        "stream={} speed={} input_len={} input_preview={!r}",
         req.model,
         req.voice,
         req.response_format,
+        req.stream,
         req.speed,
         len(req.input),
         input_preview,
     )
     logger.info(
         "[OpenAI /v1/audio/speech] mapped: reference_id={!r} format={!r} "
-        "builtin_voice={}",
+        "streaming={} builtin_voice={}",
         serve_req.reference_id,
         serve_req.format,
+        serve_req.streaming,
         serve_req.reference_id is None,
     )
     if available_reference_ids is not None:
